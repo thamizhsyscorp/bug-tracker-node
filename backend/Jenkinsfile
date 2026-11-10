@@ -1,0 +1,179 @@
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME        = 'bug-tracker-backend'
+        IMAGE_NAME      = 'bug-tracker-backend'
+        IMAGE_TAG       = "${env.BUILD_NUMBER ?: 'latest'}"
+        CONTAINER_NAME  = 'bug-tracker-backend'
+        HOST_PORT       = '5000'
+        CONTAINER_PORT  = '5000'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Initialize & Detect Workspace') {
+            steps {
+                script {
+                    // Check if repository root or backend folder is the workspace
+                    if (fileExists('Dockerfile')) {
+                        env.APP_DIR = '.'
+                    } else if (fileExists('backend/Dockerfile')) {
+                        env.APP_DIR = 'backend'
+                    } else {
+                        env.APP_DIR = '.'
+                    }
+
+                    echo "============================================="
+                    echo "Application:     ${env.APP_NAME}"
+                    echo "Build Number:    ${env.BUILD_NUMBER}"
+                    echo "App Directory:   ${env.APP_DIR}"
+                    echo "Host Port:       ${env.HOST_PORT}"
+                    echo "Container Port:  ${env.CONTAINER_PORT}"
+                    echo "============================================="
+                }
+                sh 'docker --version'
+            }
+        }
+
+        stage('Test') {
+            steps {
+                dir("${env.APP_DIR}") {
+                    sh '''
+                        echo "Running pre-build tests..."
+                        if command -v npm > /dev/null 2>&1; then
+                            npm test
+                        else
+                            echo "npm not installed on Jenkins agent host; skipping host npm test."
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir("${env.APP_DIR}") {
+                    sh '''
+                        echo "Building Docker image: ${IMAGE_NAME}:${IMAGE_TAG} and ${IMAGE_NAME}:latest..."
+                        docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" -t "${IMAGE_NAME}:latest" .
+                    '''
+                }
+            }
+        }
+
+        stage('Stop Old Container') {
+            steps {
+                sh '''
+                    echo "Checking if old container '${CONTAINER_NAME}' exists..."
+                    if [ -n "$(docker ps -a -q -f name=^/${CONTAINER_NAME}$)" ]; then
+                        echo "Stopping and removing existing container: ${CONTAINER_NAME}"
+                        docker stop "${CONTAINER_NAME}" || true
+                        docker rm -f "${CONTAINER_NAME}" || true
+                    else
+                        echo "No existing container named '${CONTAINER_NAME}' found."
+                    fi
+                '''
+            }
+        }
+
+        stage('Run Docker Container') {
+            steps {
+                dir("${env.APP_DIR}") {
+                    sh '''
+                        ENV_FILE_OPTION=""
+                        if [ -f .env ]; then
+                            echo "Found .env file; mounting into container environment"
+                            ENV_FILE_OPTION="--env-file .env"
+                        elif [ -f backend/.env ]; then
+                            echo "Found backend/.env file; mounting into container environment"
+                            ENV_FILE_OPTION="--env-file backend/.env"
+                        else
+                            echo "Warning: .env file not found. Ensure required environment variables (MONGO_URI, JWT_SECRET, PORT) are provided."
+                        fi
+
+                        echo "Starting container '${CONTAINER_NAME}' on port ${HOST_PORT}:${CONTAINER_PORT}..."
+                        docker run -d \
+                            --name "${CONTAINER_NAME}" \
+                            -p "${HOST_PORT}:${CONTAINER_PORT}" \
+                            --restart unless-stopped \
+                            ${ENV_FILE_OPTION} \
+                            "${IMAGE_NAME}:${IMAGE_TAG}"
+                    '''
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                    echo "Waiting 5 seconds for container initialization..."
+                    sleep 5
+
+                    # Verify container is running
+                    STATUS=$(docker inspect -f '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo "not_found")
+                    echo "Container status: ${STATUS}"
+
+                    if [ "${STATUS}" != "running" ]; then
+                        echo "ERROR: Container ${CONTAINER_NAME} is not running!"
+                        echo "=== Container Logs ==="
+                        docker logs --tail 50 "${CONTAINER_NAME}" || true
+                        exit 1
+                    fi
+
+                    # Verify HTTP endpoint if curl is available
+                    if command -v curl > /dev/null 2>&1; then
+                        echo "Probing http://localhost:${HOST_PORT}/ for health status..."
+                        MAX_RETRIES=6
+                        COUNT=1
+                        READY=0
+
+                        while [ ${COUNT} -le ${MAX_RETRIES} ]; do
+                            echo "Health check attempt ${COUNT}/${MAX_RETRIES}..."
+                            BODY=$(curl -s "http://localhost:${HOST_PORT}/" || true)
+                            if echo "${BODY}" | grep -q "Bug Tracker API"; then
+                                echo "Health check PASSED: ${BODY}"
+                                READY=1
+                                break
+                            fi
+                            sleep 5
+                            COUNT=$((COUNT + 1))
+                        done
+
+                        if [ ${READY} -ne 1 ]; then
+                            echo "ERROR: Health check failed after ${MAX_RETRIES} attempts."
+                            echo "=== Container Logs ==="
+                            docker logs --tail 50 "${CONTAINER_NAME}" || true
+                            exit 1
+                        fi
+                    else
+                        echo "curl is not installed on Jenkins agent; skipping HTTP endpoint probe."
+                    fi
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+                echo "Pruning dangling Docker images..."
+                docker image prune -f || true
+            '''
+        }
+        success {
+            echo "SUCCESS: ${env.APP_NAME} build #${env.BUILD_NUMBER} deployed successfully."
+            sh 'docker ps -f name=^/${CONTAINER_NAME}$'
+        }
+        failure {
+            echo "FAILURE: ${env.APP_NAME} build #${env.BUILD_NUMBER} failed."
+            sh 'docker logs --tail 100 "${CONTAINER_NAME}" || true'
+        }
+    }
+}
