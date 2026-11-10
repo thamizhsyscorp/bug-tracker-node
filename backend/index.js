@@ -85,7 +85,7 @@ app.post("/api/login",loginMiddleware,async (req, res) => {
 
 app.get("/", (req, res) => {
     console.log("Hello from the backend!");
-    res.send("Bug Tracker API is running New");
+    res.send("Bug Tracker API is running New New New");
 });
 app.use("/api/bugs", bugRoutes);
 app.use("/api/projects", projectRoutes);
